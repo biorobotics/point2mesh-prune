@@ -9,19 +9,23 @@ from point2mesh.util import priority_queue
 
 from point2mesh.triangle_mesh import point_to_triangle_squared_distance,brute_force_point2mesh_cpu
 
+from typing import Iterable
+from typing import List as AnnotationList
+from numpy.typing import ArrayLike
+
 rss=namedtuple("RSS",["rotation_matrix","center","half_lengths","radius"])
 rssnode=namedtuple("rssnode",["triangles","parent","child_plus","child_minus","centroid","axes","RSS","depth","is_leaf"])
 
 @njit
-def set_children(node,child_plus,child_minus):
+def set_children(node:rssnode,child_plus:int,child_minus:int):
     is_leaf=child_plus<0 and child_minus<0
     return rssnode(node.triangles,node.parent,child_plus,child_minus,node.centroid,node.axes,node.RSS,node.depth,is_leaf)
 @njit
-def set_leaf(node,is_leaf):
+def set_leaf(node:rssnode,is_leaf:bool):
     return rssnode(node.triangles,node.parent,node.child_plus,node.child_minus,node.centroid,node.axes,node.RSS,node.depth,is_leaf)
 
 @njit
-def construct_rss_tree(triangle_ids,triangle_vertices,max_depth=np.inf,leaf_size=1):
+def construct_rss_tree(triangle_ids:Iterable[int],triangle_vertices:ArrayLike,max_depth=np.inf,leaf_size=1)->AnnotationList[rssnode]:
     '''
     build a binary tree of Rectangular Swept Spheres top down following the approach of Li, Shellshear, Bohlin, and Carlson 2020
 
@@ -33,6 +37,8 @@ def construct_rss_tree(triangle_ids,triangle_vertices,max_depth=np.inf,leaf_size
                     don't split nodes with depth>=max_depth (root has depth 1!)
                 leaf_size : int or 1 (default)
                     stop splitting when the set of triangles assigned is =<leaf_size
+    Return:     rsstree : numba List of rssnode
+                    the nodes of the rss tree
     '''
     local_triangles=triangle_vertices[triangle_ids]
     center,split_axes=get_center_and_split_axes(local_triangles)
@@ -64,7 +70,7 @@ def construct_rss_tree(triangle_ids,triangle_vertices,max_depth=np.inf,leaf_size
     return List(nodes)
 
 @njit
-def get_center_and_split_axes(triangles):
+def get_center_and_split_axes(triangles:ArrayLike):
     '''
     pick a point and axes to split a group of triangles along using the inertia properties following Li 2020 Sec IV
 
@@ -89,7 +95,7 @@ def get_center_and_split_axes(triangles):
     return centroid,eigvecs
 
 @njit
-def triangle_inertia_tensor_contrib(triangle,area,centroid):
+def triangle_inertia_tensor_contrib(triangle:ArrayLike,area:float,centroid:ArrayLike):
     vertex_moment_arms=triangle-centroid
     I=np.empty((3,3),dtype=triangle.dtype)
     for j in range(3):
@@ -98,7 +104,7 @@ def triangle_inertia_tensor_contrib(triangle,area,centroid):
     return area*I
 
 @njit
-def fit_RSS(triangles,axes):
+def fit_RSS(triangles:ArrayLike,axes:ArrayLike):
     '''
     fits a rectangular swept sphere volume to triangles using given axes, following the approach in PQP (see PQP/src/BV.cpp)
 
@@ -150,7 +156,7 @@ def fit_RSS(triangles,axes):
 
 
 @njit
-def get_range(points,cz,radsqr,axis_id):
+def get_range(points:ArrayLike,cz:float,radsqr:float,axis_id:int):
     #compute an initial length of rectangle along local direction
     minidx=np.argmin(points[:,axis_id])
     maxidx=np.argmax(points[:,axis_id])
@@ -174,7 +180,7 @@ def get_range(points,cz,radsqr,axis_id):
     return minx,maxx
 
 @njit       
-def extend_corners(point,xbound,ybound,cz,radsqr,xup,yup):
+def extend_corners(point:ArrayLike,xbound:float,ybound:float,cz:float,radsqr:float,xup:bool,yup:bool):
     a=sqrt(0.5)
     if xup:
         xdir=1
@@ -195,7 +201,7 @@ def extend_corners(point,xbound,ybound,cz,radsqr,xup,yup):
     return xbound,ybound
 
 @njit
-def IPS_split_rule(parent_idx,parent_node,triangle_vertices,leaf_size):
+def IPS_split_rule(parent_idx:int,parent_node:rssnode,triangle_vertices:ArrayLike,leaf_size:int):
     triangle_indices=parent_node.triangles
     n=len(triangle_indices)
     triangle_centroid_diff=np.sum(triangle_vertices[triangle_indices],1)/3-parent_node.centroid#n,3
@@ -255,7 +261,7 @@ def IPS_split_rule(parent_idx,parent_node,triangle_vertices,leaf_size):
     return plus_node,minus_node,best_cost<np.inf
 
 @njit
-def rss_surface_area(rss_query):
+def rss_surface_area(rss_query:rss)->float:
     '''
     compute the surface area of a specified RSS
     '''
@@ -269,7 +275,7 @@ def rss_surface_area(rss_query):
     return faces_sa+sphere_sa+cylinder_sa
 
 @njit
-def point_rss_squared_distance(point,rss_query):
+def point_rss_squared_distance(point:ArrayLike,rss_query:rss)->float:
     '''
     compute the minimum squared distance from a point to a specified RSS (0 if inside)
 
@@ -301,40 +307,41 @@ def point_rss_squared_distance(point,rss_query):
         return actual_dist*actual_dist
 
 @njit
-def get_distance_queue(query,rsstree,triangle_vertices):
-    best_distance_squared=np.inf
-    count=0
-    queue=priority_queue.make_queue(0,0.0)
-    while not priority_queue.is_empty(queue):
-        queue,lower_bound,nodeid=priority_queue.get_item(queue)
-        node=rsstree[nodeid]
-        if best_distance_squared<lower_bound:
-            #nothing left in the queue that can do better
-            break
-        if not node.is_leaf:
-            #we need to process child_plus if it exists and the bounding volume is closer to query than our best distance yet found
-            if node.child_plus>=0:
-                distance_to_plus_rss=point_rss_squared_distance(query,rsstree[node.child_plus].RSS)
-                if distance_to_plus_rss<best_distance_squared:
-                    queue=priority_queue.add_item(queue,node.child_plus,distance_to_plus_rss)
-            if node.child_minus>=0:
-                distance_to_minus_rss=point_rss_squared_distance(query,rsstree[node.child_minus].RSS)
-                if distance_to_minus_rss<best_distance_squared:
-                    queue=priority_queue.add_item(queue,node.child_minus,distance_to_minus_rss)
-        else:
-            #leaf node, which may be empty
-            #get a candidate distance as the nearest triangle in the leaf node
-            tol=1e-12
-            for triangle_id in node.triangles:
-                triangle=triangle_vertices[triangle_id]
-                tri_dist_squared=fabs(point_to_triangle_squared_distance(triangle[0],triangle[1],triangle[2],query,tol))
-                count+=1
-                if tri_dist_squared<best_distance_squared:
-                    best_distance_squared=tri_dist_squared
-    return sqrt(best_distance_squared),count
+def get_distance_queue(query:ArrayLike,rsstree:AnnotationList[rssnode],triangle_vertices:ArrayLike):
+    '''
+    compute distance query to the mesh
+
+    Parameters: query : (3,) float array
+                    the point to test
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+    Returns:    distance : float
+                    the distance from query to mesh
+                count : int
+                    number of triangles tested
+    '''
+    return get_distance_with_bound(query,rsstree,triangle_vertices,np.inf)
 
 @njit
-def get_distance_with_bound(query,rsstree,triangle_vertices,upper_bound_squared):
+def get_distance_with_bound(query:ArrayLike,rsstree:AnnotationList[rssnode],triangle_vertices:ArrayLike,upper_bound_squared:float):
+    '''
+    compute distance query to the mesh, assumes distance is below some passed in number
+
+    Parameters: query : (3,) float array
+                    the point to test
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                upper_bound_squared : float
+                    the squared distance the true distance is <=
+    Returns:    distance : float
+                    the distance from query to mesh, unless upper_bound_squared was wrong in which case this is sqrt(upper_bound_squared)
+                count : int
+                    number of triangles tested
+    '''
     best_distance_squared=upper_bound_squared
     count=0
     queue=priority_queue.make_queue(0,0.0)
@@ -419,6 +426,20 @@ def is_distance_lte(query,rsstree,triangle_vertices,upper_bound_squared):
 
 @njit
 def point2mesh_via_rss_serial(points,triangle_vertices,rsstree):
+    '''
+    compute distance query to the mesh
+
+    Parameters: points : (n,3) float array
+                    the points to test
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+    Returns:    distances : (n,) float array
+                    the distance from query to mesh
+                counts : (n,) int array
+                    number of triangles tested
+    '''
     distances=np.empty(len(points))
     counts=np.empty(len(points),dtype=np.int64)
     for i,point in enumerate(points):
@@ -426,6 +447,22 @@ def point2mesh_via_rss_serial(points,triangle_vertices,rsstree):
     return distances,counts
 
 def point2mesh_via_rss_and_kdtree(points,triangle_vertices,rsstree,kdtree):
+    '''
+    compute distance query to the mesh, assumes distance is below some passed in number. Tries to use a kdtree to get a bound on each distance before using rsstree.
+
+    Parameters: points : (n,3) float array
+                    the points to test
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                kdtree : scipy.spatial.KDTree
+                    KDTree of the mesh vertices
+    Returns:    distances : (n,) float array
+                    the distance from query to mesh
+                counts : (n,) int array
+                    number of triangles tested
+    '''
     distances=np.empty(len(points))
     counts=np.empty(len(points),dtype=np.int64)
     distances=kdtree.query(points)[0]
@@ -436,6 +473,18 @@ def point2mesh_via_rss_and_kdtree(points,triangle_vertices,rsstree,kdtree):
 
 @njit(parallel=True)
 def verify_rsstree_distance(test_points,triangle_vertices,rsstree):
+    '''
+    compute distance query to the mesh using brute force and RSStree, then compare
+
+    Parameters: test_points : (n,3) float array
+                    the points to test
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+    Returns:    errors : (n,) float array
+                    the absolute difference in distance from RSStree and brute force
+    '''
     errors=np.empty(len(test_points))
     for i in prange(len(test_points)):
         linked_dist,_=get_distance_queue(test_points[i],rsstree,triangle_vertices)
