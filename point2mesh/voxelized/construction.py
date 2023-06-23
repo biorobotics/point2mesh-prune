@@ -2,7 +2,9 @@
 code for computing voxelized approximations of the Generalized Voronoi Diagram of a triangular mesh
 '''
 from multiprocessing import Pool
+from typing import List,Tuple
 
+from numpy.typing import ArrayLike,NDArray
 import numpy as np
 import fcl
 import trimesh
@@ -13,7 +15,27 @@ from point2mesh.util.triangle_geometry import parallel_squared_distance_triangle
 
 from point2mesh.triangle_mesh import multiple_points_to_triangle_squared_distance,tri_to_points_squared_hausdorff
 
-def make_pruned_point_to_mesh_ragged_array(spacing,meshes,expansion_factor):
+def make_pruned_point_to_mesh_ragged_array(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float)->Tuple[List[NDArray[np.intp]],List[NDArray[np.intp]],NDArray[np.float_],NDArray[np.intp]]:
+    '''
+    voxelize domains around a collection of meshes and for each mesh, return the pruned triangle sets for each voxel
+
+    Parameters: spacing : float
+                    the edge length of the voxels to use
+                meshes : n element list[trimesh.Trimesh]
+                    list of triangle meshes to process
+                expansion_factor : scalar
+                    the domain voxelized is expansion_factor*axis aligned bounding box of each mesh
+    Returns:    candidate_triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the ids of the triangles tested for each voxel. 
+                    The offset at which each voxel starts is recorded in voxel2triangles.
+                    Thus, for mesh 0, candidate_triangles[0][voxel2triangles[0][i]:voxel2triangles[0][i+1]] is the triangles that need to be tested for points in voxel i
+                voxel2triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the offset at which voxel i begins in candidate_triangles.
+                minimums : (n,3) float array
+                    for each mesh, the smallest xyz value contained in the voxelization
+                domain_widths : (n,3) int array
+                    for each mesh, the number of voxels along each axis         
+    '''
     candidate_triangles=[]
     voxel2triangles=[]
     minimums=[]
@@ -46,7 +68,29 @@ def make_pruned_point_to_mesh_ragged_array(spacing,meshes,expansion_factor):
     domain_widths=np.array(domain_widths)
     return candidate_triangles,voxel2triangles,minimums,domain_widths
 
-def multiprocess_make_pruned_point_to_mesh_ragged_array(spacing,meshes,expansion_factor,n_workers):
+def multiprocess_make_pruned_point_to_mesh_ragged_array(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float,n_workers:int)->Tuple[List[NDArray[np.intp]],List[NDArray[np.intp]],NDArray[np.float_],NDArray[np.intp]]:
+    '''
+    use multiprocessing to voxelize domains around a collection of meshes and for each mesh, return the pruned triangle sets for each voxel
+
+    Parameters: spacing : float
+                    the edge length of the voxels to use
+                meshes : n element list[trimesh.Trimesh]
+                    list of triangle meshes to process
+                expansion_factor : scalar
+                    the domain voxelized is expansion_factor*axis aligned bounding box of each mesh
+                n_workers : int
+                    number of worker processes to use
+    Returns:    candidate_triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the ids of the triangles tested for each voxel. 
+                    The offset at which each voxel starts is recorded in voxel2triangles.
+                    Thus, for mesh 0, candidate_triangles[0][voxel2triangles[0][i]:voxel2triangles[0][i+1]] is the triangles that need to be tested for points in voxel i
+                voxel2triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the offset at which voxel i begins in candidate_triangles.
+                minimums : (n,3) float array
+                    for each mesh, the smallest xyz value contained in the voxelization
+                domain_widths : (n,3) int array
+                    for each mesh, the number of voxels along each axis  
+    '''
     candidate_triangles=[]
     voxel2triangles=[]
     minimums=[]
@@ -76,7 +120,27 @@ def multiprocess_make_pruned_point_to_mesh_ragged_array(spacing,meshes,expansion
     domain_widths=np.array(domain_widths)
     return candidate_triangles,voxel2triangles,minimums,domain_widths
 
-def make_pruned_point_to_mesh_gpu_array(spacing,meshes,expansion_factor):
+def make_pruned_point_to_mesh_gpu_array(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float):
+    '''
+    voxelize domains around a collection of meshes and for each mesh, return the pruned triangle sets for each voxel as GPU arrays
+
+    Parameters: spacing : float
+                    the edge length of the voxels to use
+                meshes : n element list[trimesh.Trimesh]
+                    list of triangle meshes to process
+                expansion_factor : scalar
+                    the domain voxelized is expansion_factor*axis aligned bounding box of each mesh
+    Returns:    candidate_triangles : list[DeviceNDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the ids of the triangles tested for each voxel. 
+                    The offset at which each voxel starts is recorded in voxel2triangles.
+                    Thus, for mesh 0, candidate_triangles[0][voxel2triangles[0][i]:voxel2triangles[0][i+1]] is the triangles that need to be tested for points in voxel i
+                voxel2triangles : list[DeviceNDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the offset at which voxel i begins in candidate_triangles.
+                minimums : (n,3) float Device array
+                    for each mesh, the smallest xyz value contained in the voxelization
+                domain_widths : (n,3) int Device array
+                    for each mesh, the number of voxels along each axis         
+    '''
     candidate_triangles,voxel2triangles,minimums,domain_widths=make_pruned_point_to_mesh_ragged_array(spacing,meshes,expansion_factor)
     #put arrays on GPU
     candidates_gpu=[cuda.to_device(ct) for ct in candidate_triangles]
@@ -84,15 +148,27 @@ def make_pruned_point_to_mesh_gpu_array(spacing,meshes,expansion_factor):
     return candidates_gpu,voxel2triangles_gpu,cuda.to_device(minimums),cuda.to_device(domain_widths)
 
 def init_get_candidates_pruning(mesh,spacing):
+    '''
+    initialize worker for computing triangle sets for voxels
+
+    Parameters: mesh : trimesh.Trimesh
+                    the mesh to consider
+                spacing : float
+                    the edge length of the voxels to use
+    defines globals g_mesh, g_spacing, and g_collision_mesh
+    '''
     global g_mesh,g_spacing,g_collision_mesh
     g_collision_mesh=fcl.CollisionObject(trimesh.collision.mesh_to_BVH(mesh),fcl.Transform())
     g_mesh=mesh
     g_spacing=spacing
 
 def worker_get_candidates_pruning(pt):
+    '''
+    call get_candidate_triangles_with_pruning for a specific point using globals g_mesh, g_collision_mesh, and g_spacing
+    '''
     return get_candidate_triangles_with_pruning(pt,g_mesh,g_collision_mesh,g_spacing)
 
-def get_candidate_triangles_with_pruning(pt,mesh,collision_mesh,spacing):
+def get_candidate_triangles_with_pruning(pt:ArrayLike,mesh:trimesh.Trimesh,collision_mesh:fcl.CollisionObject,spacing:float):
     '''
     core function to compute for a voxel a small set of triangles that contains the triangle closest to each point in the voxel
 

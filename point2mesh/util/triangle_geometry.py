@@ -32,12 +32,31 @@ https://www.geometrictools.com/License/Boost/LICENSE_1_0.txt
 Version: 6.0.2022.01.06
 '''
 import numpy as np
+from numpy.typing import ArrayLike
 
 from numba import njit,prange,cuda
 
 from point2mesh.util.Math import normsquared,singleton_clip
 
-def gpu_squared_distance_triangles_to_aligned_box(triangle_ids,triangle_vertices_on_gpu,side_lengths,center,threads_per_block=1024):
+DeviceNDArray=cuda.devicearray.DeviceNDArray
+def gpu_squared_distance_triangles_to_aligned_box(triangle_ids:ArrayLike,triangle_vertices_on_gpu:DeviceNDArray,
+                                                  side_lengths:ArrayLike,center:ArrayLike,threads_per_block=1024):
+    '''
+    compute squared distances from a collection of triangles to an axis-aligned box using the GPU
+
+    Parameters: triangle_ids : (n,) int array
+                    the indices for triangle_vertices_on_gpu specifying the triangles to test
+                triangle_vertices_on_gpu : (m,3,3) device float array, 32bit for best performance
+                    vertices of the triangles
+                side_lengths : (3,) float array
+                    the length of the box along each axis
+                center: (3,) float array
+                    the coordinates of the center of the box
+                threads_per_block : int, default 1024
+                    # of threads to launch per block
+    Return :    dsquared : (n,) float array
+                    squared distance from each triangle in triangle_ids to the box (0 if intersecting)
+    '''
     n=len(triangle_ids)
     distances=np.empty(n,dtype=np.float32)
     blocks_per_grid=(n+(threads_per_block-1))//threads_per_block
@@ -49,13 +68,39 @@ def gpu_squared_distance_triangles_to_aligned_box(triangle_ids,triangle_vertices
     return distances
 
 @cuda.jit()
-def kernel_squared_distance_triangles_to_aligned_box(triangle_ids,triangle_vertices,side_lengths,center,distances):
+def kernel_squared_distance_triangles_to_aligned_box(triangle_ids:DeviceNDArray,triangle_vertices:DeviceNDArray,side_lengths:DeviceNDArray,center:DeviceNDArray,distances:DeviceNDArray):
+    '''
+    kernel to compute squared distances from a collection of triangles to an axis-aligned box using the GPU
+
+    Parameters: triangle_ids : (n,) int device array
+                    the indices for triangle_vertices_on_gpu specifying the triangles to test
+                triangle_vertices_on_gpu : (m,3,3) device float array, 32bit for best performance
+                    vertices of the triangles
+                side_lengths : (3,) float device array
+                    the length of the box along each axis
+                center: (3,) float device array
+                    the coordinates of the center of the box
+                distances : (n,) float device array
+                    will be populated with squared distance from each triangle to the box (0 if intersecting)
+    '''
     tidx=cuda.grid(1)
     if tidx>=len(triangle_ids) or triangle_ids[tidx]>=len(triangle_vertices):
         return
     distances[tidx]=squared_distance_triangle_to_aligned_box(triangle_vertices[triangle_ids[tidx]],side_lengths,center)
 @njit(parallel=False)
-def parallel_squared_distance_triangles_to_aligned_box(triangles,side_lengths,center):
+def parallel_squared_distance_triangles_to_aligned_box(triangles:ArrayLike,side_lengths:ArrayLike,center:ArrayLike):
+    '''
+    compute squared distances from a collection of triangles to an axis-aligned box
+
+    Parameters: triangles : (n,3,3) float array
+                    vertices of the triangles
+                side_lengths : (3,) float array
+                    the length of the box along each axis
+                center: (3,) float array
+                    the coordinates of the center of the box
+    Return :    dsquared : (n,) float array
+                    squared distance from each triangle to the box (0 if intersecting)
+    '''
     n=len(triangles)
     dsquared=np.empty(n)
     for i in prange(n):
@@ -63,16 +108,39 @@ def parallel_squared_distance_triangles_to_aligned_box(triangles,side_lengths,ce
     return dsquared
 
 @njit
-def squared_distance_triangle_to_aligned_box(triangle,side_lengths,center):
+def squared_distance_triangle_to_aligned_box(triangle:ArrayLike,side_lengths:ArrayLike,center:ArrayLike):
+    '''
+    compute squared distances from a triangle to an axis-aligned box
+
+    Parameters: triangles : (3,3) float array
+                    vertices of the triangle
+                side_lengths : (3,) float array
+                    the length of the box along each axis
+                center: (3,) float array
+                    the coordinates of the center of the box
+    Return :    dsquared : float
+                    squared distance from the triangle to the box (0 if intersecting)
+    '''
     pt_on_tri,pt_on_box=closest_point_on_triangle_to_aligned_box(triangle,side_lengths,center)
     return normsquared(pt_on_tri-pt_on_box)
 @njit
-def closest_point_on_triangle_to_aligned_box(triangle,side_lengths,center):
+def closest_point_on_triangle_to_aligned_box(triangle:ArrayLike,side_lengths:ArrayLike,center:ArrayLike):
+    '''
+    find closest point on a triangle to an axis aligned box
+
+    Parameters: triangle : (3,3) float array
+                    each entry is a vertex
+                side_lengths : (3,) float array
+                    x,y,z side lengths of the axis aligned box
+                center: (3,) float array
+                    the coordinates of the center of the box
+    Returns: (3,) float closest point on triangle to the box, (3,) float closest point on the box to the triangle
+    '''
     shifted_triangle=triangle-center
     closest_on_tri,closest_on_box=closest_point_on_triangle_to_canonical_box(shifted_triangle,side_lengths)
     return closest_on_tri+center,closest_on_box+center
 @njit
-def closest_point_on_triangle_to_canonical_box(triangle,side_lengths):
+def closest_point_on_triangle_to_canonical_box(triangle:ArrayLike,side_lengths:ArrayLike):
     '''
     find closest point on a triangle to an axis aligned box centered at the origin
 
@@ -108,7 +176,7 @@ def closest_point_on_triangle_to_canonical_box(triangle,side_lengths):
             i0=i1
     return closest_on_tri,closest_on_box
 @njit
-def closest_point_on_plane_to_canonical_box(normal,point_on_plane,side_lengths):
+def closest_point_on_plane_to_canonical_box(normal:ArrayLike,point_on_plane:ArrayLike,side_lengths:ArrayLike):
     '''
     finds closest point on a plane to an axis aligned box centered at the origin
 
@@ -170,7 +238,7 @@ def closest_point_on_plane_to_canonical_box(normal,point_on_plane,side_lengths):
     return closest_on_plane,closest_on_box
 
 @njit
-def plane_canonicalbox_3d_query(origin,normal,extents):
+def plane_canonicalbox_3d_query(origin:ArrayLike,normal:ArrayLike,extents:ArrayLike):
     '''
     computes paired closest points for plane to canonical box for generic case. Internal use only.
 
@@ -200,7 +268,7 @@ def plane_canonicalbox_3d_query(origin,normal,extents):
             closest_on_box=closest_on_plane.copy()
     return closest_on_plane,closest_on_box
 @njit
-def plane_canonicalbox_2d_query(i0,i1,i2,origin,normal,extents):
+def plane_canonicalbox_2d_query(i0:int,i1:int,i2:int,origin:ArrayLike,normal:ArrayLike,extents:ArrayLike):
     '''
     computes paired closest points for plane to canonical box when one normal component is 0. Internal use only.
 
