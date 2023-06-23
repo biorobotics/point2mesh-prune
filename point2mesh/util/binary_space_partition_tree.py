@@ -11,7 +11,7 @@ from numba import njit,prange
 from numba.typed import List,Dict
 
 from point2mesh.triangle_mesh import point_to_triangle_squared_distance
-
+from typing import List as AnnotationList
 
 bspnode=namedtuple("bspnode",["triangles","parent","child_plus","child_minus","point","normal","depth","is_leaf"])
 
@@ -59,6 +59,14 @@ def split_on_first_helpful(triangle_ids,triangle_vertex_array,arg,free_splits):
 def split_random(triangle_ids,triangle_vertex_array,rng,free_splits):
     '''
     split on a random triangle
+
+    Parameters: triangle_ids : List[int]
+                    numba List of indices of triangles in triangle_vertex_array
+                triangle_vertex_array : (m,3,3) float array
+                    array of triangle vertices
+                rng : np.random.Generator
+                    random number generator for picking a random triangle to split with
+                free_splits : 
     '''
     total=len(triangle_ids)
     left_to_try=total
@@ -287,7 +295,7 @@ def construct(split_function,split_arg,triangles,max_depth,leaf_size):
     construct binary splits of passed triangles according to specified splitting rule, up to a maximum depth and/or leaf size
 
     Parameters: split_function : function handle: list of triangles indices,array of all triangle vertices, split_arg->first child tris, second child tris, plane pt, plane normal
-                    function tests if should be split and returns the split, or all in first child tris w/ None for plane pt and normal
+                    function tests if a set of triangles should be split and returns the split. If not, all returned in first child tris w/ None for plane pt and normal
                 split_arg : anything
                      passed to split_function as third argument
                 triangles : n,3,3 np array of triangles corners
@@ -337,7 +345,23 @@ def construct_on_subset(split_function,split_arg,triangles,indices_to_use,max_de
     return List(nodes)
 
 @njit
-def get_distance_recursive(query,node,bspnodes,triangle_vertices,best_distance=np.inf,distance_cache=None,count=0):
+def get_distance_recursive(query,node:bspnode,bspnodes:AnnotationList[bspnode],triangle_vertices,best_distance=np.inf,distance_cache=None,count=0):
+    '''
+    compute distance between query point and mesh using BSPtree and recursion
+
+    Parameters: query : (3,) float array
+                    point to find distance for
+                node : bspnode
+                    the node to start descending the tree from
+                bspnodes : List[bspnode]
+                    the BSP tree
+                triangle_vertices : (n,3,3) float array
+                    the triangles of the mesh, expressed using their vertices
+    Returns:    distance : float
+                    the distance (not squared distance) to the mesh
+                count : int
+                    the number of triangles tested to compute the distance
+    '''
     if distance_cache is None:
         distance_cache=np.full(len(triangle_vertices),-1.0)
     #descend the tree
@@ -384,7 +408,19 @@ def get_distance_recursive(query,node,bspnodes,triangle_vertices,best_distance=n
         return sqrt(mindistsquared),count
 
 @njit
-def get_distance_leaf(query,node,triangle_vertices):
+def get_distance_leaf(query,node:bspnode,triangle_vertices):
+    '''
+    compute min distance between a query point and the triangles of a BSP tree node
+
+    Parameters: query : (3,) float array
+                    the point to test
+                node : bpsnode
+                    the BPSnode
+                triangle_vertices : (m,3,3)
+                    the vertices of ALL the triangles of the mesh. node.triangles indexes into this
+    Return:     distance : float
+                    the smallest distance between a triangle in the node and query. Not squared!
+    '''
     tol=1e-12
     mindistsquared=np.inf
     for triangle_id in node.triangles:
@@ -396,6 +432,20 @@ def get_distance_leaf(query,node,triangle_vertices):
 
 @njit
 def get_distance_queue(query,bspnodes,triangle_vertices):
+    '''
+    compute distance between query point and mesh using BSPtree and a priority queue
+
+    Parameters: query : (3,) float array
+                    point to find distance for
+                bspnodes : List[bspnode]
+                    the BSP tree
+                triangle_vertices : (n,3,3) float array
+                    the triangles of the mesh, expressed using their vertices
+    Returns:    distance : float
+                    the distance (not squared distance) to the mesh
+                count : int
+                    the number of triangles tested to compute the distance
+    '''
     best_distance_squared=np.inf
     distance_cache=np.full(len(triangle_vertices),-1.0)
     best_distance_squared,count=get_distance_squared(query,bspnodes,triangle_vertices,distance_cache,best_distance_squared)
@@ -403,6 +453,24 @@ def get_distance_queue(query,bspnodes,triangle_vertices):
 
 @njit
 def get_distance_squared(query,bspnodes,triangle_vertices,distance_cache,best_distance_squared):
+    '''
+    compute squared distance between query point and mesh using BSPtree and a priority queue
+
+    Parameters: query : (3,) float array
+                    point to find distance for
+                bspnodes : List[bspnode]
+                    the BSP tree
+                triangle_vertices : (n,3,3) float array
+                    the triangles of the mesh, expressed using their vertices
+                distance_cache : (n,) float array
+                    entry i should be negative or the squared distance from query to the ith triangle
+                best_distance_squared : float
+                    an overestimate of the squared distance between query point and mesh (if underestimate, result will be wrong!)
+    Returns:    squared_distance : float
+                    the squared distance to the mesh. If best_distance_squared was smaller than the true squared distance, it will be returned here!
+                count : int
+                    the number of triangles tested to compute the distance
+    '''
     queue=priority_queue.make_queue(0,0.0)
     count=0
     while not priority_queue.is_empty(queue):
@@ -440,6 +508,22 @@ def get_distance_squared(query,bspnodes,triangle_vertices,distance_cache,best_di
 
 @njit
 def distance_record_traversal(query,bspnodes,triangle_vertices):
+    '''
+    compute distance between query point and mesh using BSPtree and a priority queue. Records which bspnodes are considered
+
+    Parameters: query : (3,) float array
+                    point to find distance for
+                bspnodes : List[bspnode]
+                    the BSP tree
+                triangle_vertices : (n,3,3) float array
+                    the triangles of the mesh, expressed using their vertices
+    Returns:    distance : float
+                    the distance (not squared distance) to the mesh
+                count : int
+                    the number of triangles tested to compute the distance
+                node_ids : list[int]
+                    the indices in bspnodes of the tree nodes considered during computation
+    '''
     node_ids=[]
     best_distance_squared=np.inf
     distance_cache=np.full(len(triangle_vertices),-1.0)
@@ -483,6 +567,20 @@ def distance_record_traversal(query,bspnodes,triangle_vertices):
 
 @njit
 def point2mesh_via_bsp_serial(points,triangle_vertices,bspnodes):
+    '''
+    compute distance from collection of points to a mesh using BSPtree
+
+    Parameters: points : (m,3) float array
+                    query points
+                triangle_vertices : (n,3,3) float array
+                    the triangles of the mesh, expressed using their vertices
+                bspnodes : List[bspnode]
+                    the BSP tree
+    Returns:    distances : (m,) float array
+                    the distances from points to the mesh (not squared)
+                counts : (m,) int array
+                    the number of triangles tested for each query point
+    '''
     distances=np.empty(len(points))
     counts=np.empty(len(points),dtype=np.int64)
     for i,point in enumerate(points):
@@ -492,7 +590,7 @@ def point2mesh_via_bsp_serial(points,triangle_vertices,bspnodes):
 @njit(parallel=True)
 def verify_bsp_distance(test_points,bspnodes,triangle_iterable):
     '''
-    compare the result of the bsp distance calc and brute force on specified test points
+    compare the result of the bsp distance calc without using a priority queue and brute force on specified test points
 
     test_points: (n,3) float array of query points
     bspnodes: list of bspnode
