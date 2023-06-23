@@ -2,13 +2,19 @@
 generic distance and closest point functions for points to triangular meshes
 '''
 from math import ceil,sqrt
+from typing import Union,Tuple
+
 import numpy as np
+from numpy.typing import ArrayLike
+
 from numba import njit,cuda,prange
+DeviceNDArray=cuda.devicearray.DeviceNDArray
+
 import fcl
 import trimesh
 
 @njit
-def closest_point_on_triangle(triangle,query,tol=None):
+def closest_point_on_triangle(triangle:ArrayLike,query:ArrayLike,tol:Union[float,None]=None)->ArrayLike:
     '''
     compute the coordinates of the point in a triangle closest to a 3D point
     
@@ -75,18 +81,24 @@ def closest_point_on_triangle(triangle,query,tol=None):
     return a+ab*v+ac*w
 
 @njit
-def cuda_3d_error(array1,id1,array2,id2):
+def cuda_3d_error(array1:DeviceNDArray,id1:int,array2:DeviceNDArray,id2:int):
+    '''
+    array1[id1:id1+3]-array2[id2:id2+3] as a tuple
+    '''
     e1=array1[id1]-array2[id2]
     e2=array1[id1+1]-array2[id2+1]
     e3=array1[id1+2]-array2[id2+2]
     return e1,e2,e3
 
 @njit
-def cuda_dot(x1,y1,z1,x2,y2,z2):
+def cuda_dot(x1:float,y1:float,z1:float,x2:float,y2:float,z2:float):
+    '''
+    dot product of vector 1 (first 3 args) and vector 2 (last 3 args)
+    '''
     return x1*x2+y1*y2+z1*z2
 
 @cuda.jit
-def closest_point_on_triangles_cuda(triangles,queries,output):
+def closest_point_on_triangles_cuda(triangles:DeviceNDArray,queries:DeviceNDArray,output:DeviceNDArray):
     '''
     compute the coordinates of the point in a triangle closest to a 3D point
     
@@ -180,7 +192,7 @@ def closest_point_on_triangles_cuda(triangles,queries,output):
     return
 
 @njit
-def cuda_closest_point_on_triangle(triangle,query,tol):
+def cuda_closest_point_on_triangle(triangle:ArrayLike,query:ArrayLike,tol:float):
     '''
     compute closest point on a flattened triangle to a query point
 
@@ -203,7 +215,7 @@ def cuda_closest_point_on_triangle(triangle,query,tol):
     return closest_point_on_triangle(A,B,C,query,tol)
 
 @njit
-def closest_point_on_triangle(A,B,C,query,tol):
+def closest_point_on_triangle(A:ArrayLike,B:ArrayLike,C:ArrayLike,query:ArrayLike,tol:float)->Tuple[float,float,float]:
     '''
     compute the coordinates of the point in a triangle closest to a single 3D point
     
@@ -276,7 +288,7 @@ def closest_point_on_triangle(A,B,C,query,tol):
     return A[0]+v*abx+w*acx,A[1]+v*aby+w*acy,A[2]+v*abz+w*acz
 
 @cuda.jit
-def non_unique_closest_point_on_triangles_cuda(triangles,queries,query_pairs,output):
+def non_unique_closest_point_on_triangles_cuda(triangles:DeviceNDArray,queries:DeviceNDArray,query_pairs:DeviceNDArray,output:DeviceNDArray):
     '''
     compute the coordinates of the point in a triangle closest to a 3D point, when neither triangles nor queries are unique
     
@@ -377,7 +389,7 @@ def non_unique_closest_point_on_triangles_cuda(triangles,queries,query_pairs,out
     return
 
 @cuda.jit
-def non_unique_point_to_triangle_cuda(triangles,queries,query_pairs,output):
+def non_unique_point_to_triangle_cuda(triangles:DeviceNDArray,queries:DeviceNDArray,query_pairs:DeviceNDArray,output:DeviceNDArray):
     '''
     compute minimum squared distance from point to a triangle when neither triangles nor queries are unique
     
@@ -404,26 +416,43 @@ def non_unique_point_to_triangle_cuda(triangles,queries,query_pairs,output):
     output[thread_index]=cuda_point_to_triangle_squared_distance(triangles[triangle_index:triangle_index+9],queries[point_index:point_index+3],tol)
 
 @njit
-def cuda_vec3_minus(left,right):
+def cuda_vec3_minus(left:DeviceNDArray,right:DeviceNDArray)->Tuple[float,float,float]:
+    '''
+    compute left-right for two three element vectors, return as a tuple
+    '''
     return left[0]-right[0],left[1]-right[1],left[2]-right[2]
 
 @njit
-def cuda_point_to_triangle_squared_distance(triangle,query,tol):
+def cuda_point_to_triangle_squared_distance(triangle:ArrayLike,query:ArrayLike,tol:float):
     '''
-    compute distance from a flattened triangle to a query point
+    compute squared distance from a flattened triangle to a query point, works on both cpu and gpu
 
-    triangle: (9,) array
-    query: (3,) array
-    tol: float
+    @param triangle: (9,) array
+    @param query: (3,) array
+    @param tol: float
+    @return distance : float, squared distance
     '''
     A=triangle[0:3]
     B=triangle[3:6]
     C=triangle[6:9]
     return point_to_triangle_squared_distance(A,B,C,query,tol)
 @njit
-def point_to_triangle_squared_distance(A,B,C,query,tol):
+def point_to_triangle_squared_distance(A:ArrayLike,B:ArrayLike,C:ArrayLike,query:ArrayLike,tol:float):
     '''
     given vertices of a triangle and a query point compute the shortest distance
+
+    Parameters: A : (3,) float array
+                    first vertex
+                B : (3,) float array
+                    second vertex
+                C : (3,) float array
+                    third vertex
+                query : (3,) float array
+                    the query point
+                tol : float
+                    values smaller than this in absolute value are considered 0
+    Return:     distance : float
+                    squared distance from point to triangle
     '''
     #First thing is to check if the query point is closest to vertices A or B
     #check vertex a
@@ -484,7 +513,23 @@ def point_to_triangle_squared_distance(A,B,C,query,tol):
     return ex*ex+ey*ey+ez*ez
 
 @njit(parallel=False)
-def multiple_points_to_triangle_squared_distance(A,B,C,queries,tol):
+def multiple_points_to_triangle_squared_distance(A:ArrayLike,B:ArrayLike,C:ArrayLike,queries:ArrayLike,tol:float):
+    '''
+    for a triangle and collection of points, find the squared distance to each point
+
+    Parameters: A : (3,) float array
+                    first vertex
+                B : (3,) float array
+                    second vertex
+                C : (3,) float array
+                    third vertex
+                queries : (n,3) float array
+                    points to test
+                tol : float
+                    numbers smaller than this will be treated as 0 during point to triangle distance calculation
+    Return :    dist : float
+                    squared distance to each point from the triangle
+    '''
     n=len(queries)
     distances=np.empty(n)
     for i in prange(n):
@@ -492,7 +537,23 @@ def multiple_points_to_triangle_squared_distance(A,B,C,queries,tol):
     return distances
 
 @njit
-def points_to_triangle_max_squared_distance(A,B,C,queries,tol):
+def points_to_triangle_max_squared_distance(A:ArrayLike,B:ArrayLike,C:ArrayLike,queries:ArrayLike,tol:float):
+    '''
+    for a triangle and collection of points, find the squared distance to the point furthest from the triangle
+
+    Parameters: A : (3,) float array
+                    first vertex
+                B : (3,) float array
+                    second vertex
+                C : (3,) float array
+                    third vertex
+                queries : (n,3) float array
+                    points to test
+                tol : float
+                    numbers smaller than this will be treated as 0 during point to triangle distance calculation
+    Return :    dist : float
+                    squared distance to point furthest from the triangle
+    '''
     dist=-1.0
     for query in queries:
         candidate=point_to_triangle_squared_distance(A,B,C,query,tol)
@@ -500,7 +561,7 @@ def points_to_triangle_max_squared_distance(A,B,C,queries,tol):
             dist=candidate
     return dist
 
-def closest_point_on_triangles_trimesh(triangles, queries, tol=None):
+def closest_point_on_triangles_trimesh(triangles:ArrayLike, queries:ArrayLike, tol:Union[float,None]=None):
     '''
     compute the coordinates of the point in triangle closest to 3D point for n triangle, point pairs
     
@@ -608,7 +669,7 @@ def closest_point_on_triangles_trimesh(triangles, queries, tol=None):
     return result
 
 @njit
-def closest_point_on_triangles_numba(triangles, queries, tol=None):
+def closest_point_on_triangles_numba(triangles:ArrayLike, queries:ArrayLike, tol:Union[float,None]=None):
     '''
     compute the coordinates of the point in triangle closest to 3D point for n triangle, point pairs
     
@@ -632,7 +693,7 @@ def closest_point_on_triangles_numba(triangles, queries, tol=None):
     return result
 
 @njit
-def closest_point_on_triangles_trimesh_numba(triangles, queries, tol=None):
+def closest_point_on_triangles_trimesh_numba(triangles:ArrayLike, queries:ArrayLike, tol:Union[float,None]=None):
     '''
     compute the coordinates of the point in triangle closest to 3D point for n triangle, point pairs
     
@@ -740,7 +801,7 @@ def closest_point_on_triangles_trimesh_numba(triangles, queries, tol=None):
 
     return result
     
-def brute_force_points2mesh(points,triangles_on_device,threads_per_block=1024):
+def brute_force_points2mesh(points:ArrayLike,triangles_on_device:DeviceNDArray,threads_per_block=1024)->float:
     '''
     compute distance from each of a set of points to a collection of triangles
 
@@ -769,7 +830,17 @@ def brute_force_points2mesh(points,triangles_on_device,threads_per_block=1024):
     return np.min(distances.copy_to_host(),1)
 
 @cuda.jit
-def brute_force_points2mesh_kernel(queries,triangles,distances):
+def brute_force_points2mesh_kernel(queries:DeviceNDArray,triangles:DeviceNDArray,distances:DeviceNDArray):
+    '''
+    CUDA kernel to compute distance from each of a set of points to a collection of triangles
+
+    Parameters: queries : (n,3) float device array
+                    the points to compute distances for
+                triangles_on_device : (m*9,) float device array
+                    the vertices of the triangles, as a flattened C-order device array
+                distances : (n,m) float device array
+                    will be populated with the actual, guaranteed non-negative, distance from each point to each triangle
+    '''
     tol=1e-12
     qid,tid=cuda.grid(2)
     if qid>=len(distances) or tid*9>=len(triangles):
@@ -777,7 +848,7 @@ def brute_force_points2mesh_kernel(queries,triangles,distances):
     else:
         distances[qid,tid]=sqrt(abs(cuda_point_to_triangle_squared_distance(triangles[tid*9:tid*9+9],queries[qid],tol)))
 
-def point2mesh_via_fcl(points,mesh,fcl_collision_mesh=None):
+def point2mesh_via_fcl(points:ArrayLike,mesh:trimesh.Trimesh,fcl_collision_mesh:Union[fcl.CollisionObject,None]=None):
     if fcl_collision_mesh is None:
         bvh=trimesh.collision.mesh_to_BVH(mesh)
         fcl_collision_mesh=fcl.CollisionObject(bvh,fcl.Transform())
@@ -785,14 +856,33 @@ def point2mesh_via_fcl(points,mesh,fcl_collision_mesh=None):
     return np.array([fcl.distance(fcl_collision_mesh,fcl.CollisionObject(sphere,fcl.Transform(np.eye(3),pt))) for pt in points])
 
 @njit
-def brute_force_point2mesh_cpu(point,triangles):
+def brute_force_point2mesh_cpu(point:ArrayLike,triangles:ArrayLike)->float:
+    '''
+    compute distance from a point to a collection of triangles
+
+    Parameters: point : (3,) float array
+                    the point to compute distances for
+                triangles: (m,3,3) float array
+                    the vertices of the m triangles
+    Return:     distance : float array
+                    the actual, guaranteed non-negative, distance from point to the nearest triangle
+    '''
     tol=1e-12
     return np.sqrt(min([point_to_triangle_squared_distance(t[0],t[1],t[2],point,tol) for t in triangles]))
 
 @njit(parallel=False)
-def tri_to_points_squared_hausdorff(triangles,points):
+def tri_to_points_squared_hausdorff(triangles:ArrayLike,points:ArrayLike)->Tuple[float,np.intp]:
     '''
     one sided hausdorff (squared) distance from triangles to points; i.e. maximize over points and minimze over triangles
+
+    Parameters: triangles : (ntri,3,3) float array
+                    the vertices of the ntri triangles
+                points : (npts,3) float array
+                    the points to compute distances to
+    Returns:    distance : float
+                    for each triangle, find the point furthest from it. Return the smallest such squared distance.
+                best_tri : int
+                    the index in triangles of the triangle for which the furthest point in points is least far
     '''
     tol=1e-12
     ntri=len(triangles)
@@ -804,8 +894,10 @@ def tri_to_points_squared_hausdorff(triangles,points):
     best_tri=np.argmin(dist)
     return dist[best_tri],best_tri
 
-def gpu_tris_to_points_squared_hausdorff(triangle_ids,triangle_vertices_on_device,points,threads_per_block=1024):
+def gpu_tris_to_points_squared_hausdorff(triangle_ids:ArrayLike,triangle_vertices_on_device:DeviceNDArray,points:ArrayLike,threads_per_block=1024):
     '''
+    WARNING: may return erroneous results. No specific issue identified but code that has used it has been wrong.
+
     compute squared distance from some triangles to some points, then maximize over points and minimize over triangles using GPU
 
     Parameters: triangle_ids : m entry list or array of integers
@@ -816,7 +908,7 @@ def gpu_tris_to_points_squared_hausdorff(triangle_ids,triangle_vertices_on_devic
                     the query points to test
                 threads_per_block : int, default 1024
                     # of threads to launch per block
-    Returns: 32 bit distance minimized over triangles and maximized over points
+    Returns: squared 32 bit distance minimized over triangles and maximized over points
     '''
     m=len(triangle_vertices_on_device)
 
@@ -829,7 +921,21 @@ def gpu_tris_to_points_squared_hausdorff(triangle_ids,triangle_vertices_on_devic
     return min_reduce(distances)
 
 @cuda.jit
-def kernel_tris_to_points_max_squared_distance(triangle_ids,triangle_vertices_on_device,points,distances):
+def kernel_tris_to_points_max_squared_distance(triangle_ids:DeviceNDArray,triangle_vertices_on_device:DeviceNDArray,points:DeviceNDArray,distances:DeviceNDArray):
+    '''
+    WARNING: may return erroneous results. No specific issue identified but code that has used it has been wrong.
+
+    GPU kernel to compute squared distance from some triangles to some points, then maximize over points
+
+    Parameters: triangle_ids : (m,) int devie array
+                    the indices of the triangles to test
+                triangle_vertices_on_device : (n,3,3) float device array (32bit for best performance)
+                    the vertices of all triangles, to be indexed by entries of triangle_ids
+                points : (k,3) float device array (32bit for best performance)
+                    the query points to test
+                distances (m,) float device array (match type of points)
+                    squared distance from each triangle to the point furthest from it
+    '''
     tidx=cuda.grid(1)
     if tidx>=len(triangle_ids) or triangle_ids[tidx]>=len(triangle_vertices_on_device):
         return
