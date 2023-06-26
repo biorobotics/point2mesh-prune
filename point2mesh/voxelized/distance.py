@@ -16,7 +16,7 @@ from point2mesh import triangle_mesh
 
 DeviceNDArray=cuda.devicearray.DeviceNDArray
 
-def point2mesh_via_gpu(points:ArrayLike,mesh:triangle_mesh.trimesh.Trimesh,voxels2triangles:DeviceNDArray[nb_int64],candidate_triangles:DeviceNDArray[nb_int64],minimums:DeviceNDArray[nb_float32],spacing:nb_float32,domain_width:DeviceNDArray[nb_float32],threads_per_block=1024):
+def point2mesh_via_gpu(points:ArrayLike,mesh:triangle_mesh.trimesh.Trimesh,voxels2triangles:DeviceNDArray,candidate_triangles:DeviceNDArray,minimums:DeviceNDArray,spacing:nb_float32,domain_width:DeviceNDArray,threads_per_block=1024):
     '''
     use ragged array representation of GVD on GPU to compute point to mesh distance for many points
 
