@@ -9,9 +9,10 @@ import numpy as np
 import fcl
 import trimesh
 
-from numba import cuda
+from numba import cuda,njit
 
 from point2mesh.util.triangle_geometry import parallel_squared_distance_triangles_to_aligned_box
+from point2mesh.util import bounding_volume_hierarchy
 
 from point2mesh.triangle_mesh import multiple_points_to_triangle_squared_distance,tri_to_points_squared_hausdorff
 
@@ -238,6 +239,57 @@ def get_candidate_triangles_with_pruning(pt:ArrayLike,mesh:trimesh.Trimesh,colli
     sides=spacing*np.ones((3,))
     center=pt+spacing/2
     minimum_distances=parallel_squared_distance_triangles_to_aligned_box(Striangles,sides,center)
+    #Step 7
+    #keep only those triangles whose minimum distance is less than the upper bound
+    return np.array([Si for idx,Si in enumerate(S) if upper_bound>minimum_distances[idx]])
+
+@njit
+def get_candidate_triangles_via_rss(pt:ArrayLike,triangles:ArrayLike,rsstree:List[bounding_volume_hierarchy.rssnode],spacing:float):
+    '''
+    core function to compute for a voxel a small set of triangles that contains the triangle closest to each point in the voxel
+
+    Parameters: pt : (3,) float array
+                    the corner of the voxel with the smallest coordinate values
+                mesh : trimesh.Trimesh
+                    the mesh
+                collision_mesh : fcl.CollisionObject
+                    the mesh with FCL collision preprocessing done
+                spacing : float or (3,) float array
+                    the edge lengths of the voxel. Not tested with non-singleton value!
+    Returns: integer array containing the ids of the triangles in the set
+    '''
+    corner_shifts=np.array([[0,0,0],[0,0,1],[0,1,0],[1,0,0],[0,1,1],[1,0,1],[1,1,0],[1,1,1]])
+    #make voxel
+    side_lengths=spacing*np.ones(3)
+    center=pt+side_lengths/2
+    corners=pt+corner_shifts*spacing
+    #test if any triangles intersect the voxel
+    triangle_ids,_,_=bounding_volume_hierarchy.aligned_box_get_nearby_triangles(side_lengths,center,rsstree,triangles,0.0)
+    if len(triangle_ids)>0:
+        #Step 2
+        #for each intersecting triangle, compute the maximum distance to a corner of the voxel
+        #then set l1 to the minimum of that over all intersecting triangles
+        l1squared,triangle_idx=tri_to_points_squared_hausdorff(triangles[np.array(triangle_ids)],corners)
+        T1=triangle_ids[triangle_idx]
+        l1=np.sqrt(l1squared)
+    else:
+        #no intersecting T1, so for step 1 we instead use the nearest triangle to the voxel
+        _,_,T1=bounding_volume_hierarchy.get_aligned_box_distance_queue(side_lengths,center,rsstree,triangles)
+        triangle=triangles[T1]
+        #Step 2
+        #get the maximum distance between the triangle nearest the voxel and a point in the voxel
+        #this is equal to the maximum distance from a corner of the uninflated voxel to the triangle
+        #this is still conservative in that another triangle with the same or slightly larger minimum distance could have smaller max corner distance
+        l1=np.sqrt(np.max(multiple_points_to_triangle_squared_distance(triangle[0],triangle[1],triangle[2],corners,1e-12)))
+
+    #Step 2, 3, and 6
+    #get all triangles that could potentially be closer to a point in V than T1 is by returning all triangles whose min distance is not larger than l1
+    S,minimum_distances,_=bounding_volume_hierarchy.aligned_box_get_nearby_triangles(side_lengths,center,rsstree,triangles,l1)
+    Striangles=triangles[np.array(S)]
+    #Step 5
+    #over every triangle Ti in S, find the maximum distance between any point in V and Ti (the one-sided Hausdorff distance from V to Ti)
+    upper_bound_squared,_=tri_to_points_squared_hausdorff(Striangles,corners)
+    upper_bound=np.sqrt(upper_bound_squared)
     #Step 7
     #keep only those triangles whose minimum distance is less than the upper bound
     return np.array([Si for idx,Si in enumerate(S) if upper_bound>minimum_distances[idx]])
