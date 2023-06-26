@@ -9,10 +9,10 @@ import numpy as np
 import fcl
 import trimesh
 
-from numba import cuda,njit
+from numba import cuda,njit,prange
 
 from point2mesh.util.triangle_geometry import parallel_squared_distance_triangles_to_aligned_box
-from point2mesh.util import bounding_volume_hierarchy
+from point2mesh.util import bounding_volume_hierarchy,ArrayTricks
 
 from point2mesh.triangle_mesh import multiple_points_to_triangle_squared_distance,tri_to_points_squared_hausdorff
 
@@ -120,6 +120,65 @@ def multiprocess_make_pruned_point_to_mesh_ragged_array(spacing:float,meshes:Lis
     minimums=np.array(minimums)
     domain_widths=np.array(domain_widths)
     return candidate_triangles,voxel2triangles,minimums,domain_widths
+
+def make_pruned_point_to_mesh_using_rss(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float)->Tuple[List[NDArray[np.intp]],List[NDArray[np.intp]],NDArray[np.float_],NDArray[np.intp]]:
+    '''
+    voxelize domains around a collection of meshes and for each mesh, return the pruned triangle sets for each voxel. Uses RSStree to accelerate.
+
+    Parameters: spacing : float
+                    the edge length of the voxels to use
+                meshes : n element list[trimesh.Trimesh]
+                    list of triangle meshes to process
+                expansion_factor : scalar
+                    the domain voxelized is expansion_factor*axis aligned bounding box of each mesh
+    Returns:    candidate_triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the ids of the triangles tested for each voxel. 
+                    The offset at which each voxel starts is recorded in voxel2triangles.
+                    Thus, for mesh 0, candidate_triangles[0][voxel2triangles[0][i]:voxel2triangles[0][i+1]] is the triangles that need to be tested for points in voxel i
+                voxel2triangles : list[NDArray[np.intp]]
+                    each list entry corresponds to a mesh. It records as a 1D array the offset at which voxel i begins in candidate_triangles.
+                minimums : (n,3) float array
+                    for each mesh, the smallest xyz value contained in the voxelization
+                domain_widths : (n,3) int array
+                    for each mesh, the number of voxels along each axis         
+    '''
+    candidate_triangles=[]
+    voxel2triangles=[]
+    minimums=[]
+    domain_widths=[]
+    for mesh in meshes:
+        scaled_half_edge=mesh.bounding_box.extents*expansion_factor/2
+        maximums=scaled_half_edge+mesh.bounding_box.transform[:3,3]
+        minimums.append(mesh.bounding_box.transform[:3,3]-scaled_half_edge)
+        gridvectors=tuple(np.arange(minimums[-1][i],maximums[i],spacing) for i in range(3))
+        domain_width=np.array([len(gv) for gv in gridvectors])
+        domain_widths.append(domain_width)
+        npts=np.prod(domain_width)
+        gridpoints=np.stack(np.meshgrid(*gridvectors,indexing='ij'),axis=-1).reshape(npts,3)
+        integer_positions=np.stack(np.meshgrid(*tuple(np.arange(len(gv)) for gv in gridvectors),indexing='ij'),axis=-1).reshape(npts,3)
+        
+        triangle_list,triangle_counts=jittable_prune_using_rss(gridpoints,integer_positions,mesh.triangles,spacing,domain_width)
+        #convert list of arrays to flat array plus an array of offsets
+        voxel2triangles.append(np.concatenate(([0],np.cumsum(triangle_counts[:-1]))))
+        flat_array=np.concatenate(triangle_list)
+        candidate_triangles.append(flat_array)
+    minimums=np.array(minimums)
+    domain_widths=np.array(domain_widths)
+    return candidate_triangles,voxel2triangles,minimums,domain_widths
+
+@njit(parallel=True)
+def jittable_prune_using_rss(gridpoints,integer_positions,triangles,spacing,domain_width):
+    npts=len(gridpoints)
+    triangle_list=[np.empty(0,dtype=np.intp)]*npts
+    triangle_counts=[0]*npts
+    
+    #compute which triangles of the mesh can be nearest to a point in a given voxel
+    rsstree=bounding_volume_hierarchy.construct_rss_tree(np.arange(len(triangles)),triangles,leaf_size=20)
+    for i in prange(npts):
+        flat_index=ArrayTricks.point_to_index(integer_positions[i],domain_width)
+        triangle_list[flat_index]=get_candidate_triangles_via_rss(gridpoints[i],triangles,rsstree,spacing)
+        triangle_counts[flat_index]=len(triangle_list[flat_index])
+    return triangle_list,triangle_counts
 
 def make_pruned_point_to_mesh_gpu_array(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float):
     '''
