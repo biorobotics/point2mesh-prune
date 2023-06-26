@@ -4,8 +4,8 @@ import numpy as np
 from numba import njit,prange
 from numba.typed import List
 
-from point2mesh.util.Math import stable_triangle_area
-from point2mesh.util import priority_queue
+from point2mesh.util.Math import stable_triangle_area,normsquared
+from point2mesh.util import priority_queue,triangle_geometry
 
 from point2mesh.triangle_mesh import point_to_triangle_squared_distance,brute_force_point2mesh_cpu
 
@@ -305,6 +305,237 @@ def point_rss_squared_distance(point:ArrayLike,rss_query:rss)->float:
         return 0.0
     else:
         return actual_dist*actual_dist
+    
+@njit
+def aligned_box_rss_distance(side_lengths:ArrayLike,center:ArrayLike,rss_query:rss):
+    '''
+    finds distance from an axis-aligned box to a specified RSS (negative if intersecting)
+
+    Parameters: side_lengths : (3,) float array
+                    length of box in each axis
+                center : (3,) float array
+                    center of box
+                rss_query : rss
+                    the RSS to test against
+    Return:     distance:
+                    the distance between the two (negative if intersecting)
+    '''
+    #first, find the point on the plane of the RSS's rectangle that is closest to the box
+    normal=rss_query.rotation_matrix[2]#this vector is perpendicular to the rectangle of the RSS
+    rss_center_in_canonical_frame=rss_query.center-center#a point in the rectangle, now in a frame that is // to world frame and centered on the center of the box
+
+    pt_on_plane_in_canonical,pt_on_box_in_canonical=triangle_geometry.closest_point_on_plane_to_canonical_box(normal,rss_center_in_canonical_frame,side_lengths)
+
+    #determine if the point on the rectangle plane is in the rectangle or not
+    v=pt_on_plane_in_canonical-rss_center_in_canonical_frame
+    local_v=rss_query.rotation_matrix@v
+    in_rectangle=True
+    for i in range(2):
+        project_on_local=local_v[i]
+        e=rss_query.half_lengths[i]
+        if project_on_local<-e or project_on_local>e:
+            in_rectangle=False
+    if in_rectangle:
+        #closest point on RSS to box is at rss_query.radius along the vector from the point on the plane to the point on the box
+        actual_dist=np.linalg.norm(pt_on_box_in_canonical-pt_on_plane_in_canonical)-rss_query.radius
+    else:
+        #closest point on RSS to box is at rss_query.radius along the vector from a point on one of the edges of the rectangle to a point on the box
+        e0_in_world=rss_query.half_lengths[0]*rss_query.rotation_matrix[0]
+        e1_in_world=rss_query.half_lengths[1]*rss_query.rotation_matrix[1]
+        corners_in_canonical=[rss_center_in_canonical_frame+e0_in_world+e1_in_world,
+                              rss_center_in_canonical_frame+e0_in_world-e1_in_world,
+                              rss_center_in_canonical_frame-e0_in_world-e1_in_world,
+                              rss_center_in_canonical_frame-e0_in_world+e1_in_world]
+        sqrDistance=np.inf
+        i0=3
+        for i1 in range(4):
+            candidate_closest_on_segment,candidate_closest_on_box=triangle_geometry.closest_point_segment_canonical_box(corners_in_canonical[i0],corners_in_canonical[i1],side_lengths)
+            newDistSquared=normsquared(candidate_closest_on_segment-candidate_closest_on_box)
+            if newDistSquared<sqrDistance:
+                sqrDistance=newDistSquared
+            i0=i1
+        actual_dist=sqrt(sqrDistance)-rss_query.radius
+    return actual_dist
+
+@njit
+def get_aligned_box_distance_queue(side_lengths:ArrayLike,center:ArrayLike,rsstree:AnnotationList[rss],triangle_vertices:ArrayLike):
+    '''
+    use RSStree and priority queue to find distance from an axis-aligned box to a triangle mesh
+
+    Parameters: side_lengths : (3,) float array
+                    length of box in each axis
+                center : (3,) float array
+                    center of box
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+    Returns:    distance : float
+                    the distance from query to mesh
+                count : int
+                    number of triangles tested
+                best_triangle : int
+                    index of triangle that was closest
+    '''
+    return get_aligned_box_distance_with_bound(side_lengths,center,rsstree,triangle_vertices,np.inf)
+
+@njit
+def get_aligned_box_distance_with_bound(side_lengths:ArrayLike,center:ArrayLike,rsstree:AnnotationList[rss],triangle_vertices:ArrayLike,upper_bound_squared:float):
+    '''
+    use RSStree and priority queue to find distance from an axis-aligned box to a triangle mesh
+
+    Parameters: side_lengths : (3,) float array
+                    length of box in each axis
+                center : (3,) float array
+                    center of box
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                upper_bound_squared : float
+                    a value known to be no smaller than the squared distance from the box
+    Returns:    distance : float
+                    the distance from query to mesh
+                count : int
+                    number of triangles tested
+                best_triangle : int
+                    index of triangle that was closest. Negative if no triangle within upper_bound_squared.
+    '''
+    best_triangle=-1
+    best_distance=sqrt(upper_bound_squared)
+    count=0
+    queue=priority_queue.make_queue(0,-np.inf)
+    while not priority_queue.is_empty(queue):
+        queue,lower_bound,nodeid=priority_queue.get_item(queue)
+        node=rsstree[nodeid]
+        if best_distance<lower_bound:
+            #nothing left in the queue that can do better
+            break
+        if not node.is_leaf:
+            #we need to process child_plus if it exists and the bounding volume is closer to query than our best distance yet found
+            if node.child_plus>=0:
+                distance_to_plus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_plus].RSS)
+                if distance_to_plus_rss<best_distance:
+                    queue=priority_queue.add_item(queue,node.child_plus,distance_to_plus_rss)
+            if node.child_minus>=0:
+                distance_to_minus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_minus].RSS)
+                if distance_to_minus_rss<best_distance:
+                    queue=priority_queue.add_item(queue,node.child_minus,distance_to_minus_rss)
+        else:
+            #leaf node, which may be empty
+            #get a candidate distance as the nearest triangle in the leaf node
+            for triangle_id in node.triangles:
+                triangle=triangle_vertices[triangle_id]
+                tri_dist=sqrt(triangle_geometry.squared_distance_triangle_to_aligned_box(triangle,side_lengths,center))
+                count+=1
+                if tri_dist<best_distance:
+                    best_distance=tri_dist
+                    best_triangle=triangle_id
+    return best_distance,count,best_triangle
+
+@njit
+def is_aligned_box_distance_lte(side_lengths,center,rsstree,triangle_vertices,upper_bound):
+    '''
+    returns if the distance from an axis aligned box to the mesh is <= a provided upper bound
+
+    Parameters: side_lengths : (3,) float array
+                    length of box in each axis
+                center : (3,) float array
+                    center of box
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                upper_bound : float
+                    the distance to see if the true distance is <=
+    Returns:    answer : bool
+                    True if squared distance is <= upper_bound_squared
+                tighter_upper_bound : float
+                    an upper bound for the distance. If answer is False, this equals upper_bound and should not be relied upon
+                count : int
+                    the number of point to triangle distance tests conducted
+    '''
+    best_distance=upper_bound
+    count=0
+    queue=priority_queue.make_queue(0,0.0)
+    while not priority_queue.is_empty(queue):
+        queue,lower_bound,nodeid=priority_queue.get_item(queue)
+        node=rsstree[nodeid]
+        if best_distance<lower_bound:
+            #nothing left in the queue that can do better
+            break
+        if not node.is_leaf:
+            #we need to process child_plus if it exists and the bounding volume is closer to query than our best distance yet found
+            if node.child_plus>=0:
+                distance_to_plus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_plus].RSS)
+                if distance_to_plus_rss<best_distance:
+                    queue=priority_queue.add_item(queue,node.child_plus,distance_to_plus_rss)
+            if node.child_minus>=0:
+                distance_to_minus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_minus].RSS)
+                if distance_to_minus_rss<best_distance:
+                    queue=priority_queue.add_item(queue,node.child_minus,distance_to_minus_rss)
+        else:
+            #leaf node, which may be empty
+            #get a candidate distance as the nearest triangle in the leaf node
+            for triangle_id in node.triangles:
+                triangle=triangle_vertices[triangle_id]
+                tri_dist=sqrt(triangle_geometry.squared_distance_triangle_to_aligned_box(triangle,side_lengths,center))
+                count+=1
+                if tri_dist<=best_distance:
+                    return True,tri_dist,count
+    return False,best_distance,count
+
+@njit
+def aligned_box_get_nearby_triangles(side_lengths,center,rsstree,triangle_vertices,upper_bound):
+    '''
+    returns all the triangles within some distance of an axis-aligned box
+
+    Parameters: side_lengths : (3,) float array
+                    length of box in each axis
+                center : (3,) float array
+                    center of box
+                rsstree : numba.typed.List of rssnodes
+                    the RSStree data structure
+                triangle_vertices : (n,3,3) float array
+                    the vertices of each triangle in the mesh
+                upper_bound : float
+                    the distance to collect triangles within
+    Returns:    triangle_ids : numba.typed.List of ints
+                    indices of the triangles within upper_bound of the axis_aligned box
+                distances : numba.typed.List of float
+                    distances to the triangles in triangle_ids
+                count : int
+                    the number of point to triangle distance tests conducted
+    '''
+    triangle_ids=list()
+    distances=list()
+    queue=List([(-np.inf,0)])
+    count=0
+    while len(queue)>0:
+        lower_bound,nodeid=queue.pop()
+        node=rsstree[nodeid]
+        if lower_bound<upper_bound:
+            if not node.is_leaf:
+                #we need to process child_plus if it exists and the bounding volume is closer to query than our upper_bound
+                if node.child_plus>=0:
+                    distance_to_plus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_plus].RSS)
+                    if distance_to_plus_rss<upper_bound:
+                        queue.append((distance_to_plus_rss,node.child_plus))
+                if node.child_minus>=0:
+                    distance_to_minus_rss=aligned_box_rss_distance(side_lengths,center,rsstree[node.child_minus].RSS)
+                    if distance_to_minus_rss<upper_bound:
+                        queue.append((distance_to_minus_rss,node.child_minus))
+            else:
+                #leaf node, which may be empty
+                #get a candidate distance as the nearest triangle in the leaf node
+                for triangle_id in node.triangles:
+                    triangle=triangle_vertices[triangle_id]
+                    tri_dist=sqrt(triangle_geometry.squared_distance_triangle_to_aligned_box(triangle,side_lengths,center))
+                    count+=1
+                    if tri_dist<=upper_bound:
+                        triangle_ids.append(triangle_id)
+                        distances.append(tri_dist)
+    return triangle_ids,distances,count
 
 @njit
 def get_distance_queue(query:ArrayLike,rsstree:AnnotationList[rssnode],triangle_vertices:ArrayLike):
