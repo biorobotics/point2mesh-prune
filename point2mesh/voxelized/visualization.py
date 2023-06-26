@@ -141,12 +141,15 @@ def highlight_triangles(mesh,triangle_ids,scene=None):
     scene.show()
     mesh.visual.face_colors=color_backup
 
-def highlight_triangles_multiple_groups(mesh,triangle_id_groups,colors):
+def highlight_triangles_multiple_groups(mesh,triangle_id_groups,colors,scene=None):
     edges=trimesh.load_path(mesh.vertices[mesh.edges_unique])
 
     color_backup=mesh.visual.face_colors.copy()
     mesh.visual.face_colors[:,-1]=100
-    scene=trimesh.Scene([mesh,edges])
+    if scene is None:
+        scene=trimesh.Scene([mesh,edges])
+    else:
+        scene.add_geometry([mesh,edges])
     for i,triangle_ids in enumerate(triangle_id_groups):
         intersection=mesh.submesh([triangle_ids],append=True)
         intersection.visual.face_colors=colors[i]
@@ -155,6 +158,7 @@ def highlight_triangles_multiple_groups(mesh,triangle_id_groups,colors):
     
     scene.show()
     mesh.visual.face_colors=color_backup
+
 
 def compare_ragged_and_dictionary_at_point(mesh,point,minimums,spacing,domain_width,voxel2triangle,candidate_triangles,hashmap,int_type):
     integer_coordinates=np.floor((point-minimums)/spacing).astype(int_type)
