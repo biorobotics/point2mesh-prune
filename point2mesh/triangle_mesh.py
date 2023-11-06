@@ -870,6 +870,31 @@ def brute_force_point2mesh_cpu(point:ArrayLike,triangles:ArrayLike)->float:
     tol=1e-12
     return np.sqrt(min([point_to_triangle_squared_distance(t[0],t[1],t[2],point,tol) for t in triangles]))
 
+@njit
+def cuda_tri_to_points_squared_hausdorff(triangles:ArrayLike,points:ArrayLike)->Tuple[float,np.intp]:
+    '''
+    one sided hausdorff (squared) distance from triangles to points; i.e. maximize over points and minimze over triangles
+
+    Parameters: triangles : (ntri,3,3) float array
+                    the vertices of the ntri triangles
+                points : (npts,3) float array
+                    the points to compute distances to
+    Returns:    distance : float
+                    for each triangle, find the point furthest from it. Return the smallest such squared distance.
+                best_tri : int
+                    the index in triangles of the triangle for which the furthest point in points is least far
+    '''
+    tol=1e-12
+    ntri=len(triangles)
+    dist=np.inf
+    best=-1
+    for i in range(ntri):
+        candidate=points_to_triangle_max_squared_distance(triangles[i,0],triangles[i,1],triangles[i,2],points,tol)
+        if candidate<dist:
+            dist=candidate
+            best=i
+    return dist,best
+
 @njit(parallel=False)
 def tri_to_points_squared_hausdorff(triangles:ArrayLike,points:ArrayLike)->Tuple[float,np.intp]:
     '''
