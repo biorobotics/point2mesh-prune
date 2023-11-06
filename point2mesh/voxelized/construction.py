@@ -14,7 +14,7 @@ from numba import cuda,njit,prange
 from point2mesh.util.triangle_geometry import parallel_squared_distance_triangles_to_aligned_box
 from point2mesh.util import bounding_volume_hierarchy,ArrayTricks
 
-from point2mesh.triangle_mesh import multiple_points_to_triangle_squared_distance,tri_to_points_squared_hausdorff
+from point2mesh.triangle_mesh import multiple_points_to_triangle_squared_distance,tri_to_points_squared_hausdorff,cuda_tri_to_points_squared_hausdorff
 
 def make_pruned_point_to_mesh_ragged_array(spacing:float,meshes:List[trimesh.Trimesh],expansion_factor:float)->Tuple[List[NDArray[np.intp]],List[NDArray[np.intp]],NDArray[np.float_],NDArray[np.intp]]:
     '''
@@ -328,7 +328,7 @@ def get_candidate_triangles_via_rss(pt:ArrayLike,triangles:ArrayLike,rsstree:Lis
         #Step 2
         #for each intersecting triangle, compute the maximum distance to a corner of the voxel
         #then set l1 to the minimum of that over all intersecting triangles
-        l1squared,triangle_idx=tri_to_points_squared_hausdorff(triangles[np.array(triangle_ids)],corners)
+        l1squared,triangle_idx=cuda_tri_to_points_squared_hausdorff(triangles[np.array(triangle_ids)],corners)
         T1=triangle_ids[triangle_idx]
         l1=np.sqrt(l1squared)
     else:
@@ -347,7 +347,7 @@ def get_candidate_triangles_via_rss(pt:ArrayLike,triangles:ArrayLike,rsstree:Lis
     Striangles=triangles[np.array(S)]
     #Step 5
     #over every triangle Ti in S, find the maximum distance between any point in V and Ti (the one-sided Hausdorff distance from V to Ti)
-    upper_bound_squared,_=tri_to_points_squared_hausdorff(Striangles,corners)
+    upper_bound_squared,_=cuda_tri_to_points_squared_hausdorff(Striangles,corners)
     upper_bound=np.sqrt(upper_bound_squared)
     #Step 7
     #keep only those triangles whose minimum distance is less than the upper bound
