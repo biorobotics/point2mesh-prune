@@ -1,8 +1,10 @@
 from collections import namedtuple
 from math import sqrt,fabs
 import numpy as np
-from numba import njit,prange
+from numba import njit,prange,cuda
 from numba.typed import List
+from numba.types import float32 as nb_float32
+from numba.types import int64 as nb_int64
 
 from point2mesh.util.Math import stable_triangle_area,normsquared
 from point2mesh.util import priority_queue,triangle_geometry
@@ -15,6 +17,40 @@ from numpy.typing import ArrayLike
 
 rss=namedtuple("RSS",["rotation_matrix","center","half_lengths","radius"])
 rssnode=namedtuple("rssnode",["triangles","parent","child_plus","child_minus","centroid","axes","RSS","depth","is_leaf"])
+array_rsstree=namedtuple("rsstree",["is_leaf","node_to_triangles","triangle_index_array","children","rotation_matrices","centers","half_lengths","radii"])
+def rsstree_to_arrays(rsstree,float_dtype=None):
+    n_nodes=len(rsstree)
+    if float_dtype is None:
+        float_dtype=rsstree[0].RSS.rotation_matrix.dtype
+    int_dtype=np.int64
+
+    rotation_matrices=np.empty((n_nodes,3,3),dtype=float_dtype)
+    centers=np.empty((n_nodes,3),dtype=float_dtype)
+    half_lengths=np.empty((n_nodes,2),dtype=float_dtype)
+    radii=np.empty((n_nodes,),dtype=float_dtype)
+
+    children=np.empty((n_nodes,2),dtype=int_dtype)
+    is_leaf=np.empty((n_nodes,),dtype=np.bool_)
+    node_to_triangles=np.empty((n_nodes+1,),dtype=int_dtype)
+
+    running_tally=0
+    for i,node in enumerate(rsstree):
+        rss=node.RSS
+        rotation_matrices[i]=rss.rotation_matrix.astype(float_dtype)
+        centers[i]=rss.center.astype(float_dtype)
+        half_lengths[i]=rss.half_lengths.astype(float_dtype)
+        radii[i]=rss.radius
+
+        children[i,0]=node.child_minus
+        children[i,1]=node.child_plus
+        is_leaf[i]=node.is_leaf
+        node_to_triangles[i]=running_tally
+        running_tally+=len(node.triangles)
+    node_to_triangles[-1]=running_tally
+    triangle_index_array=np.empty(running_tally,dtype=int_dtype)
+    for i,node in enumerate(rsstree):
+        triangle_index_array[node_to_triangles[i]:node_to_triangles[i+1]]=node.triangles
+    return array_rsstree(is_leaf,node_to_triangles,triangle_index_array,children,rotation_matrices,centers,half_lengths,radii)
 
 @njit
 def set_children(node:rssnode,child_plus:int,child_minus:int):
@@ -283,15 +319,19 @@ def point_rss_squared_distance(point:ArrayLike,rss_query:rss)->float:
     based on SqDistPointOBB in sec 5.1.5.1 of Ericson, Christer. "Real-Time Collision Detection," CRC Press 2004.
     "rotation_matrix","center","side_lengths","radius"
     '''
+    return point_rss_squared_distance_from_values(point,rss_query.rotation_matrix,rss_query.center,rss_query.half_lengths,rss_query.radius)
+    
+@njit
+def point_rss_squared_distance_from_values(point,rotation_matrix,center,half_lengths,radius):
     #find rectangle distance
-    v=point-rss_query.center
-    local_v=rss_query.rotation_matrix@v
+    v=point-center
+    local_v=rotation_matrix@v
     #z part
     sqDist=local_v[2]*local_v[2]
     #clamp x and y parts
     for i in range(2):
         project_on_local=local_v[i]
-        e=rss_query.half_lengths[i]
+        e=half_lengths[i]
         if project_on_local<-e:
             excess=project_on_local+e
         elif project_on_local>e:
@@ -300,7 +340,41 @@ def point_rss_squared_distance(point:ArrayLike,rss_query:rss)->float:
             excess=0.0
         sqDist+=excess*excess
     #sqrt and remove radius
-    actual_dist=sqrt(sqDist)-rss_query.radius
+    actual_dist=sqrt(sqDist)-radius
+    if actual_dist<0:
+        return 0.0
+    else:
+        return actual_dist*actual_dist
+
+@njit
+def cuda_vec3_minus(left,right):
+    return left[0]-right[0],left[1]-right[1],left[2]-right[2]
+@njit
+def cuda_rotate_vector(R,vx,vy,vz):
+    ox=R[0,0]*vx+R[0,1]*vy+R[0,2]*vz
+    oy=R[1,0]*vx+R[1,1]*vy+R[1,2]*vz
+    oz=R[2,0]*vx+R[2,1]*vy+R[2,2]*vz
+    return ox,oy,oz
+@njit
+def cuda_point_rss_squared_distance(point,rotation_matrix,center,half_lengths,radius):
+    #find rectangle distance
+    vx,vy,vz=cuda_vec3_minus(point,center)
+    local_v=cuda_rotate_vector(rotation_matrix,vx,vy,vz)
+    #z part
+    sqDist=local_v[2]*local_v[2]
+    #clamp x and y parts
+    for i in range(2):
+        project_on_local=local_v[i]
+        e=half_lengths[i]
+        if project_on_local<-e:
+            excess=project_on_local+e
+        elif project_on_local>e:
+            excess=project_on_local-e
+        else:
+            excess=0.0
+        sqDist+=excess*excess
+    #sqrt and remove radius
+    actual_dist=sqrt(sqDist)-radius
     if actual_dist<0:
         return 0.0
     else:
@@ -554,6 +628,100 @@ def get_distance_queue(query:ArrayLike,rsstree:AnnotationList[rssnode],triangle_
                     number of triangles tested
     '''
     return get_distance_with_bound(query,rsstree,triangle_vertices,np.inf)
+
+@njit
+def get_distance_arrays(query,rsstree_as_arrays,triangle_vertices,pending_nodes_buffer,pending_nodes_lower_bound):
+    best_distance_squared=nb_float32(np.inf)
+    count=0
+    pending_nodes=1
+    pending_nodes_buffer[0]=0
+    pending_nodes_lower_bound[0]=0.0
+    while pending_nodes>0:
+        if pending_nodes+1>=len(pending_nodes_buffer):
+            raise IndexError
+        nodeid=pending_nodes_buffer[pending_nodes-1]
+        lower_bound=pending_nodes_lower_bound[pending_nodes-1]
+        pending_nodes-=1
+        if best_distance_squared<lower_bound:
+            #children cannot be better than current best
+            continue
+        if not rsstree_as_arrays.is_leaf[nodeid]:
+            #we need to process child_plus if it exists and the bounding volume is closer to query than our best distance yet found
+            if rsstree_as_arrays.children[nodeid,1]>=0:
+                cid=rsstree_as_arrays.children[nodeid,1]
+                distance_to_plus_rss=cuda_point_rss_squared_distance(query,rsstree_as_arrays.rotation_matrices[cid],
+                                                                            rsstree_as_arrays.centers[cid],rsstree_as_arrays.half_lengths[cid],
+                                                                            rsstree_as_arrays.radii[cid])
+                if distance_to_plus_rss<best_distance_squared:
+                    pending_nodes+=1
+                    pending_nodes_buffer[pending_nodes-1]=cid
+                    pending_nodes_lower_bound[pending_nodes-1]=distance_to_plus_rss
+                    
+            if rsstree_as_arrays.children[nodeid,0]>=0:
+                cid=rsstree_as_arrays.children[nodeid,0]
+                distance_to_minus_rss=cuda_point_rss_squared_distance(query,rsstree_as_arrays.rotation_matrices[cid],
+                                                                            rsstree_as_arrays.centers[cid],rsstree_as_arrays.half_lengths[cid],
+                                                                            rsstree_as_arrays.radii[cid])
+                if distance_to_minus_rss<best_distance_squared:
+                    pending_nodes+=1
+                    pending_nodes_buffer[pending_nodes-1]=cid
+                    pending_nodes_lower_bound[pending_nodes-1]=distance_to_minus_rss
+                    
+        else:
+            #leaf node, which may be empty
+            #get a candidate distance as the nearest triangle in the leaf node
+            tol=nb_float32(1e-12)
+            start=rsstree_as_arrays.node_to_triangles[nodeid]
+            end=rsstree_as_arrays.node_to_triangles[nodeid+1]
+            for triangle_id in rsstree_as_arrays.triangle_index_array[start:end]:
+                triangle=triangle_vertices[triangle_id]
+                tri_dist_squared=fabs(point_to_triangle_squared_distance(triangle[0],triangle[1],triangle[2],query,tol))
+                count+=1
+                if tri_dist_squared<best_distance_squared:
+                    best_distance_squared=tri_dist_squared
+    return sqrt(best_distance_squared),count
+
+def point2mesh_via_rss_gpu(points,triangles_on_device,rss_on_device,kernel,threads_per_block=128):
+    '''
+    compute distance from each of a set of points to a collection of triangles
+
+    Parameters: points : (n,3) float array
+                    the points to compute distances for
+                triangles_on_device : (m,3,3) float device array
+                    the vertices of the triangles
+                rss_on_device : array_rsstree
+                    namedtuple containing RSS tree info as device arrays (see rsstree_to_arrays and array_rsstree)
+                kernel : cuda.jitted kernel function
+                    kernel to process on gpu; output of make_rss_points2mesh_kernel for some desired queue size
+                threads_per_block : int or empty (default 128)
+                    # of threads to use per block (only obeyed approximately)
+    Return:     distances : (n,) float array
+                    the actual, guaranteed non-negative, distance from each point to the nearest triangle
+    '''
+    n=len(points)
+    m=len(triangles_on_device)
+
+    blocks_per_grid=(n+(threads_per_block-1))//threads_per_block
+    kernel_signature=(blocks_per_grid,threads_per_block)
+
+    distances=cuda.device_array((n,),dtype=triangles_on_device.dtype)
+    queries=cuda.to_device(points.astype(triangles_on_device.dtype))
+
+    kernel[kernel_signature](queries,rss_on_device,triangles_on_device,distances)
+    return distances.copy_to_host()
+
+def make_rss_points2mesh_kernel(queue_size):
+    @cuda.jit
+    def rss_points2mesh_kernel(queries,rsstree_as_arrays,triangle_vertices,distance_buffer):
+        pending_nodes_buffer=cuda.local.array(queue_size,nb_int64)
+        pending_nodes_lower_bound=cuda.local.array(queue_size,nb_float32)
+        tid=cuda.grid(1)
+        if tid>=len(queries):
+            return
+        else:
+            distance_buffer[tid]=get_distance_arrays(queries[tid],rsstree_as_arrays,triangle_vertices,pending_nodes_buffer,pending_nodes_lower_bound)[0]
+    return rss_points2mesh_kernel
+
 
 @njit
 def get_distance_with_bound(query:ArrayLike,rsstree:AnnotationList[rssnode],triangle_vertices:ArrayLike,upper_bound_squared:float):
